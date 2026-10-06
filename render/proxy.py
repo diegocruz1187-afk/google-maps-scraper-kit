@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 import http.client
+import json
 import os
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from enrichment import EnrichmentManager
 
 BACKEND_HOST = "127.0.0.1"
 BACKEND_PORT = 8080
 PORT = int(os.environ.get("PORT", "10000"))
 API_KEY = os.environ.get("SCRAPER_API_KEY", "")
+ENRICHMENT = EnrichmentManager()
 
 HOP_BY_HOP = {
     "connection",
@@ -52,10 +56,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
 
     def _json(self, status, body, head_only=False):
+        payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send_bytes(
             status,
-            body.encode("utf-8"),
-            content_type="application/json",
+            payload,
+            content_type="application/json; charset=utf-8",
             head_only=head_only,
         )
 
@@ -65,16 +70,47 @@ class ProxyHandler(BaseHTTPRequestHandler):
         supplied = self.headers.get("X-API-Key", "")
         return bool(API_KEY) and supplied == API_KEY
 
+    def _read_json_body(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length) if length else b""
+        if not raw:
+            return {}
+        return json.loads(raw.decode("utf-8"))
+
+    def _handle_enrichment_post(self):
+        if not self._authorized():
+            self._json(401, {"error": "unauthorized"})
+            return
+        try:
+            payload = self._read_json_body()
+            job = ENRICHMENT.submit(payload)
+            self._json(202, job)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._json(422, {"error": "invalid_request", "message": str(exc)})
+        except Exception as exc:
+            print(f"enrichment submit error: {exc}", flush=True)
+            self._json(500, {"error": "internal_error"})
+
+    def _handle_enrichment_get(self, job_id):
+        if not self._authorized():
+            self._json(401, {"error": "unauthorized"})
+            return
+        job = ENRICHMENT.get(job_id)
+        if not job:
+            self._json(404, {"error": "not_found"})
+            return
+        self._json(200, job)
+
     def _proxy(self, head_only=False):
         if not self._authorized():
-            self._json(401, '{"error":"unauthorized"}', head_only=head_only)
+            self._json(401, {"error": "unauthorized"}, head_only=head_only)
             return
 
         if self.path == "/health":
             if backend_is_ready():
-                self._json(200, '{"status":"ok"}', head_only=head_only)
+                self._json(200, {"status": "ok"}, head_only=head_only)
             else:
-                self._json(503, '{"status":"starting"}', head_only=head_only)
+                self._json(503, {"status": "starting"}, head_only=head_only)
             return
 
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -91,14 +127,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             conn.request(self.command, self.path, body=body, headers=headers)
             resp = conn.getresponse()
-
-            # Buffer the upstream response before sending headers. The upstream API
-            # can use chunked transfer encoding; forwarding decoded chunks while
-            # stripping Transfer-Encoding leaves HTTP/1.1 clients waiting forever.
             payload = resp.read()
             response_headers = resp.getheaders()
             content_type = resp.getheader("Content-Type")
-
             self._send_bytes(
                 resp.status,
                 payload,
@@ -108,7 +139,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
         except Exception as exc:
             print(f"proxy error: {exc}", flush=True)
-            self._json(502, '{"error":"backend_unavailable"}', head_only=head_only)
+            self._json(502, {"error": "backend_unavailable"}, head_only=head_only)
         finally:
             conn.close()
 
@@ -116,9 +147,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._proxy(head_only=True)
 
     def do_GET(self):
+        prefix = "/v1/enrich/jobs/"
+        if self.path.startswith(prefix):
+            job_id = self.path[len(prefix):].split("?", 1)[0].strip("/")
+            self._handle_enrichment_get(job_id)
+            return
         self._proxy()
 
     def do_POST(self):
+        if self.path.split("?", 1)[0] == "/v1/enrich/company":
+            self._handle_enrichment_post()
+            return
         self._proxy()
 
     def do_DELETE(self):
