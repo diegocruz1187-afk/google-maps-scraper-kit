@@ -1,0 +1,15 @@
+FROM gosom/google-maps-scraper:v1.18.1
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY render/proxy.py /opt/exporadar/proxy.py
+COPY render/start.sh /opt/exporadar/start.sh
+
+RUN chmod +x /opt/exporadar/start.sh
+
+ENTRYPOINT ["/opt/exporadar/start.sh"]
