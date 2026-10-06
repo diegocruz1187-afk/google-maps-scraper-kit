@@ -98,11 +98,22 @@ def _name_score(query_name, candidate_name):
     c = _fold(candidate_name)
     if not q or not c:
         return 0
-    if q == c:
+
+    # Commercial names often vary only by spacing/punctuation:
+    # "Power Dent" vs "PowerDent", "MIX-PAC" vs "MIXPAC".
+    q_compact = q.replace(" ", "")
+    c_compact = c.replace(" ", "")
+
+    if q == c or q_compact == c_compact:
         return 60
-    if c.startswith(q) or q.startswith(c):
+    if (
+        c.startswith(q)
+        or q.startswith(c)
+        or c_compact.startswith(q_compact)
+        or q_compact.startswith(c_compact)
+    ):
         return 56
-    if q in c or c in q:
+    if q in c or c in q or q_compact in c_compact or c_compact in q_compact:
         return 52
     qt, ct = _tokens(q), _tokens(c)
     if not qt or not ct:
