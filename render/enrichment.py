@@ -2,6 +2,7 @@
 import csv
 import io
 import json
+import os
 import queue
 import re
 import threading
@@ -15,6 +16,10 @@ from urllib.error import HTTPError, URLError
 BACKEND = "http://127.0.0.1:8080"
 UA = "ExpoRadar-Enrichment/1.0"
 IMAGE_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico"}
+LIGHTWEIGHT_MODE = os.getenv("EXPO_RADAR_MAPS_LIGHTWEIGHT", "true").strip().lower() not in {"0", "false", "no", "off"}
+MAX_DEPTH = max(1, min(10, int(os.getenv("EXPO_RADAR_MAPS_MAX_DEPTH", "3"))))
+MAX_CANDIDATES = max(1, min(25, int(os.getenv("EXPO_RADAR_MAPS_MAX_CANDIDATES", "10"))))
+JOB_TTL_SECONDS = max(300, int(os.getenv("EXPO_RADAR_MAPS_JOB_TTL_SECONDS", "1800")))
 
 RAW_FIELDS = [
     "input_id", "link", "title", "category", "address", "open_hours",
@@ -197,7 +202,17 @@ def normalize_row(row, query):
         "completeness": completeness,
         "reviews": review_points,
     }
-    normalized["raw"] = {field: row.get(field, "") for field in RAW_FIELDS}
+    if LIGHTWEIGHT_MODE:
+        # Keep only compact source evidence in memory/JSON. Heavy fields such as
+        # images, reviews and open-hours are unnecessary for ExpoRadar discovery.
+        keep = {
+            "input_id", "link", "title", "category", "address", "website",
+            "phone", "review_count", "review_rating", "latitude", "longitude",
+            "cid", "status", "place_id", "owner", "complete_address", "emails",
+        }
+        normalized["raw"] = {field: row.get(field, "") for field in RAW_FIELDS if field in keep}
+    else:
+        normalized["raw"] = {field: row.get(field, "") for field in RAW_FIELDS}
     return normalized
 
 
@@ -269,6 +284,7 @@ class EnrichmentManager:
             "result": None,
             "error": None,
         }
+        self._prune_jobs()
         with self.jobs_lock:
             self.jobs[job_id] = job
         self.work.put(job_id)
@@ -310,8 +326,18 @@ class EnrichmentManager:
             "city": city,
             "state": state,
             "country": country,
-            "depth": depth,
+            "depth": min(depth, MAX_DEPTH),
         }
+
+    def _prune_jobs(self):
+        cutoff = time.time() - JOB_TTL_SECONDS
+        with self.jobs_lock:
+            stale = [
+                jid for jid, job in self.jobs.items()
+                if job.get("finished_at") and job["finished_at"] < cutoff
+            ]
+            for jid in stale:
+                self.jobs.pop(jid, None)
 
     def _worker_loop(self):
         while True:
@@ -349,8 +375,12 @@ class EnrichmentManager:
             "fast_mode": False,
             "radius": 10000,
             "depth": query["depth"],
-            "email": True,
-            "max_time": 300,
+            # ExpoRadar enriches email only after the winning domain passes
+            # ownership/Trust Gate. Website crawling here caused Playwright to
+            # open every candidate website and pushed the 512 MiB Render service
+            # into OOM restarts.
+            "email": False if LIGHTWEIGHT_MODE else True,
+            "max_time": 180,
         }
 
         upstream_id = self._create_upstream_job(upstream_payload)
@@ -359,13 +389,15 @@ class EnrichmentManager:
             raise RuntimeError(f"upstream job ended with status {status}")
 
         rows = self._download_rows(upstream_id)
-        candidates = dedupe_and_rank(rows, query)
+        candidates = dedupe_and_rank(rows, query)[:MAX_CANDIDATES]
         top = candidates[0] if candidates else None
 
         result = {
             "source": "google_maps",
             "upstream_job_id": upstream_id,
             "candidate_count": len(candidates),
+            "lightweight_mode": LIGHTWEIGHT_MODE,
+            "email_extraction": not LIGHTWEIGHT_MODE,
             "top_candidate": top,
             "candidates": candidates,
         }
