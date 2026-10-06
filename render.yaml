@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: exporadar-gmaps-scraper
+    runtime: docker
+    dockerfilePath: ./Dockerfile.render
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: SCRAPER_API_KEY
+        generateValue: true
+      - key: SCRAPER_DATA_DIR
+        value: /tmp/gmapsdata
