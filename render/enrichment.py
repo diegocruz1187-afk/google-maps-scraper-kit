@@ -268,6 +268,8 @@ class EnrichmentManager:
         self.jobs = {}
         self.jobs_lock = threading.Lock()
         self.work = queue.Queue()
+        self.geocode_cache = {}
+        self.geocode_lock = threading.Lock()
         worker = threading.Thread(target=self._worker_loop, daemon=True)
         worker.start()
 
@@ -351,6 +353,16 @@ class EnrichmentManager:
                         job["status"] = "failed"
                         job["error"] = str(exc)
                         job["finished_at"] = time.time()
+                        query = job.get("query")
+                    else:
+                        query = None
+                print(json.dumps({
+                    "level": "error",
+                    "component": "exporadar_enrichment",
+                    "job_id": job_id,
+                    "query": query,
+                    "error": str(exc),
+                }, ensure_ascii=False), flush=True)
             finally:
                 self.work.task_done()
 
@@ -445,16 +457,38 @@ class EnrichmentManager:
         )
         if not place:
             place = query["company_name"]
-        params = urllib.parse.urlencode({"format": "json", "limit": 1, "q": place})
+
+        cache_key = _fold(place)
+        with self.geocode_lock:
+            cached = self.geocode_cache.get(cache_key)
+        if cached:
+            return cached
+
+        params = urllib.parse.urlencode({
+            "format": "json",
+            "limit": 1,
+            "countrycodes": str(query.get("country") or "BR").lower(),
+            "q": place,
+        })
         req = urllib.request.Request(
             f"https://nominatim.openstreetmap.org/search?{params}",
-            headers={"User-Agent": UA},
+            headers={"User-Agent": UA, "Accept": "application/json"},
         )
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                hits = json.loads(resp.read())
-        except (HTTPError, URLError, TimeoutError) as exc:
-            raise RuntimeError(f"geocoding failed: {exc}")
-        if not hits:
-            raise RuntimeError(f"could not geocode: {place}")
-        return str(hits[0]["lat"]), str(hits[0]["lon"])
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    hits = json.loads(resp.read())
+                if hits:
+                    coords = (str(hits[0]["lat"]), str(hits[0]["lon"]))
+                    with self.geocode_lock:
+                        self.geocode_cache[cache_key] = coords
+                    return coords
+                last_error = RuntimeError(f"could not geocode: {place}")
+            except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+                last_error = exc
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+
+        raise RuntimeError(f"geocoding failed for {place}: {last_error}")
