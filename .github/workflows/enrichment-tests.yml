@@ -1,0 +1,23 @@
+name: Enrichment API Tests
+
+on:
+  push:
+    branches:
+      - feat/exporadar-enrichment-api
+  pull_request:
+    branches:
+      - master
+      - feat/exporadar-render-poc
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Compile Python modules
+        run: python -m py_compile render/proxy.py render/enrichment.py
