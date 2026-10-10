@@ -1,6 +1,6 @@
 import unittest
 
-from render.enrichment import dedupe_and_rank, normalize_row
+from render.enrichment import EnrichmentManager, dedupe_and_rank, normalize_row
 
 
 class EnrichmentRankingTests(unittest.TestCase):
@@ -83,6 +83,32 @@ class EnrichmentRankingTests(unittest.TestCase):
             ranked[0]["possible_same_entity_group"],
             ranked[1]["possible_same_entity_group"],
         )
+
+    def test_known_sao_paulo_coordinates_bypass_external_geocoder(self):
+        manager = EnrichmentManager()
+        query = {
+            "company_name": "MIXPAC",
+            "city": "São Paulo",
+            "state": "SP",
+            "country": "BR",
+            "lat": None,
+            "lon": None,
+            "depth": 1,
+        }
+        self.assertEqual(manager._geocode(query), ("-23.5506507", "-46.6333824"))
+
+    def test_supplied_coordinates_take_precedence(self):
+        manager = EnrichmentManager()
+        query = {
+            "company_name": "MIXPAC",
+            "city": "São Paulo",
+            "state": "SP",
+            "country": "BR",
+            "lat": "-23.5",
+            "lon": "-46.6",
+            "depth": 1,
+        }
+        self.assertEqual(manager._geocode(query), ("-23.5", "-46.6"))
 
 
 if __name__ == "__main__":
