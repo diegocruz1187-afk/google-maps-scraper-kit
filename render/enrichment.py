@@ -20,6 +20,9 @@ LIGHTWEIGHT_MODE = os.getenv("EXPO_RADAR_MAPS_LIGHTWEIGHT", "true").strip().lowe
 MAX_DEPTH = max(1, min(10, int(os.getenv("EXPO_RADAR_MAPS_MAX_DEPTH", "3"))))
 MAX_CANDIDATES = max(1, min(25, int(os.getenv("EXPO_RADAR_MAPS_MAX_CANDIDATES", "10"))))
 JOB_TTL_SECONDS = max(300, int(os.getenv("EXPO_RADAR_MAPS_JOB_TTL_SECONDS", "1800")))
+KNOWN_COORDS = {
+    ("sao paulo", "sp", "br"): ("-23.5506507", "-46.6333824"),
+}
 
 RAW_FIELDS = [
     "input_id", "link", "title", "category", "address", "open_hours",
@@ -323,11 +326,25 @@ class EnrichmentManager:
         depth = int(payload.get("depth", 3))
         if depth < 1 or depth > 10:
             raise ValueError("depth must be between 1 and 10")
+        lat = str(payload.get("lat", "")).strip()
+        lon = str(payload.get("lon", "")).strip()
+        if bool(lat) != bool(lon):
+            raise ValueError("lat and lon must be provided together")
+        if lat and lon:
+            try:
+                lat_num = float(lat)
+                lon_num = float(lon)
+            except ValueError:
+                raise ValueError("lat and lon must be valid numbers")
+            if not (-90 <= lat_num <= 90 and -180 <= lon_num <= 180):
+                raise ValueError("lat/lon out of range")
         return {
             "company_name": company_name,
             "city": city,
             "state": state,
             "country": country,
+            "lat": lat or None,
+            "lon": lon or None,
             "depth": min(depth, MAX_DEPTH),
         }
 
@@ -452,6 +469,18 @@ class EnrichmentManager:
         return list(csv.DictReader(io.StringIO(text)))
 
     def _geocode(self, query):
+        # Prefer coordinates supplied by the caller. This removes an unnecessary
+        # dependency on public geocoding for clients that already know the area.
+        if query.get("lat") and query.get("lon"):
+            return str(query["lat"]), str(query["lon"])
+
+        city_key = _fold(query.get("city"))
+        state_key = _fold(query.get("state"))
+        country_key = _fold(query.get("country") or "BR")
+        known = KNOWN_COORDS.get((city_key, state_key, country_key))
+        if known:
+            return known
+
         place = ", ".join(
             part for part in [query.get("city"), query.get("state"), query.get("country")] if part
         )
@@ -491,4 +520,7 @@ class EnrichmentManager:
             if attempt < 2:
                 time.sleep(1.5 * (attempt + 1))
 
-        raise RuntimeError(f"geocoding failed for {place}: {last_error}")
+        raise RuntimeError(
+            f"geocoding failed for {place}: {last_error}. "
+            "Provide lat/lon to /v1/enrich/company to bypass external geocoding."
+        )
