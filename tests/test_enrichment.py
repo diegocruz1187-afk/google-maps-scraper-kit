@@ -1,6 +1,7 @@
+import time
 import unittest
 
-from render.enrichment import EnrichmentManager, dedupe_and_rank, normalize_row
+from render.enrichment import EnrichmentManager, _query_key, dedupe_and_rank, normalize_row
 
 
 class EnrichmentRankingTests(unittest.TestCase):
@@ -109,6 +110,61 @@ class EnrichmentRankingTests(unittest.TestCase):
             "depth": 1,
         }
         self.assertEqual(manager._geocode(query), ("-23.5", "-46.6"))
+
+    def test_default_depth_is_one_for_bulk_safety(self):
+        manager = EnrichmentManager()
+        query = manager._validate_payload({
+            "company_name": "MIXPAC",
+            "city": "São Paulo",
+            "state": "SP",
+            "country": "BR",
+        })
+        self.assertEqual(query["depth"], 1)
+
+    def test_duplicate_active_company_reuses_same_job(self):
+        manager = EnrichmentManager()
+        query = manager._validate_payload({
+            "company_name": "MIXPAC",
+            "city": "São Paulo",
+            "state": "SP",
+            "country": "BR",
+        })
+        existing = {
+            "id": "existing-job",
+            "status": "pending",
+            "query": query,
+            "query_key": _query_key(query),
+            "deduplicated_requests": 0,
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "result": None,
+            "error": None,
+        }
+        with manager.jobs_lock:
+            manager.jobs[existing["id"]] = existing
+
+        returned = manager.submit({
+            "company_name": "MIXPAC",
+            "city": "São Paulo",
+            "state": "SP",
+            "country": "BR",
+        })
+        self.assertEqual(returned["id"], "existing-job")
+        self.assertEqual(returned["deduplicated_requests"], 1)
+        self.assertEqual(manager.work.qsize(), 0)
+
+    def test_completed_upstream_job_is_deleted(self):
+        manager = EnrichmentManager()
+        calls = []
+
+        def fake_request(method, path, body=None, timeout=60):
+            calls.append((method, path, timeout))
+            return 200, b""
+
+        manager._backend_request = fake_request
+        manager._delete_upstream_job("upstream-123")
+        self.assertEqual(calls, [("DELETE", "/api/v1/jobs/upstream-123", 30)])
 
 
 if __name__ == "__main__":
