@@ -17,9 +17,12 @@ BACKEND = "http://127.0.0.1:8080"
 UA = "ExpoRadar-Enrichment/1.0"
 IMAGE_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico"}
 LIGHTWEIGHT_MODE = os.getenv("EXPO_RADAR_MAPS_LIGHTWEIGHT", "true").strip().lower() not in {"0", "false", "no", "off"}
-MAX_DEPTH = max(1, min(10, int(os.getenv("EXPO_RADAR_MAPS_MAX_DEPTH", "3"))))
+MAX_DEPTH = max(1, min(10, int(os.getenv("EXPO_RADAR_MAPS_MAX_DEPTH", "1"))))
 MAX_CANDIDATES = max(1, min(25, int(os.getenv("EXPO_RADAR_MAPS_MAX_CANDIDATES", "10"))))
 JOB_TTL_SECONDS = max(300, int(os.getenv("EXPO_RADAR_MAPS_JOB_TTL_SECONDS", "1800")))
+JOB_COOLDOWN_SECONDS = max(0.0, float(os.getenv("EXPO_RADAR_MAPS_JOB_COOLDOWN_SECONDS", "5")))
+MEMORY_START_THRESHOLD_BYTES = max(64 * 1024 * 1024, int(os.getenv("EXPO_RADAR_MAPS_MEMORY_START_THRESHOLD_MB", "220")) * 1024 * 1024)
+MEMORY_WAIT_SECONDS = max(0, int(os.getenv("EXPO_RADAR_MAPS_MEMORY_WAIT_SECONDS", "60")))
 KNOWN_COORDS = {
     ("sao paulo", "sp", "br"): ("-23.5506507", "-46.6333824"),
 }
@@ -47,6 +50,25 @@ def _fold(value):
 
 def _tokens(value):
     return {t for t in _fold(value).split() if len(t) > 1}
+
+
+def _query_key(query):
+    return "|".join([
+        _fold(query.get("company_name")),
+        _fold(query.get("city")),
+        _fold(query.get("state")),
+        _fold(query.get("country") or "BR"),
+    ])
+
+
+def _memory_current_bytes():
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return int(handle.read().strip())
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def _jsonish(value, fallback=None):
@@ -278,18 +300,27 @@ class EnrichmentManager:
 
     def submit(self, payload):
         query = self._validate_payload(payload)
+        query_key = _query_key(query)
+        self._prune_jobs()
+        with self.jobs_lock:
+            for existing in self.jobs.values():
+                if existing.get("query_key") == query_key and existing.get("status") in {"pending", "working"}:
+                    existing["deduplicated_requests"] = existing.get("deduplicated_requests", 0) + 1
+                    return self.public_job(existing)
+
         job_id = str(uuid.uuid4())
         job = {
             "id": job_id,
             "status": "pending",
             "query": query,
+            "query_key": query_key,
+            "deduplicated_requests": 0,
             "created_at": time.time(),
             "started_at": None,
             "finished_at": None,
             "result": None,
             "error": None,
         }
-        self._prune_jobs()
         with self.jobs_lock:
             self.jobs[job_id] = job
         self.work.put(job_id)
@@ -312,6 +343,8 @@ class EnrichmentManager:
             "finished_at": job["finished_at"],
             "result": job["result"],
             "error": job["error"],
+            "deduplicated_requests": job.get("deduplicated_requests", 0),
+            "queue_depth": self.work.qsize(),
         }
 
     def _validate_payload(self, payload):
@@ -323,7 +356,7 @@ class EnrichmentManager:
         city = str(payload.get("city", "")).strip()
         state = str(payload.get("state", "")).strip()
         country = str(payload.get("country", "BR")).strip() or "BR"
-        depth = int(payload.get("depth", 3))
+        depth = int(payload.get("depth", 1))
         if depth < 1 or depth > 10:
             raise ValueError("depth must be between 1 and 10")
         lat = str(payload.get("lat", "")).strip()
@@ -362,6 +395,7 @@ class EnrichmentManager:
         while True:
             job_id = self.work.get()
             try:
+                self._wait_for_memory_headroom()
                 self._run_job(job_id)
             except Exception as exc:
                 with self.jobs_lock:
@@ -382,6 +416,34 @@ class EnrichmentManager:
                 }, ensure_ascii=False), flush=True)
             finally:
                 self.work.task_done()
+                if JOB_COOLDOWN_SECONDS:
+                    time.sleep(JOB_COOLDOWN_SECONDS)
+
+    def _wait_for_memory_headroom(self):
+        if MEMORY_WAIT_SECONDS <= 0:
+            return
+        deadline = time.time() + MEMORY_WAIT_SECONDS
+        while True:
+            current = _memory_current_bytes()
+            if current is None or current <= MEMORY_START_THRESHOLD_BYTES:
+                return
+            if time.time() >= deadline:
+                print(json.dumps({
+                    "level": "warning",
+                    "component": "exporadar_enrichment",
+                    "message": "memory remained above start threshold; delaying job start timed out",
+                    "memory_bytes": current,
+                    "threshold_bytes": MEMORY_START_THRESHOLD_BYTES,
+                }), flush=True)
+                return
+            print(json.dumps({
+                "level": "info",
+                "component": "exporadar_enrichment",
+                "message": "waiting for memory headroom before next Maps job",
+                "memory_bytes": current,
+                "threshold_bytes": MEMORY_START_THRESHOLD_BYTES,
+            }), flush=True)
+            time.sleep(3)
 
     def _run_job(self, job_id):
         with self.jobs_lock:
@@ -412,30 +474,35 @@ class EnrichmentManager:
             "max_time": 180,
         }
 
-        upstream_id = self._create_upstream_job(upstream_payload)
-        status = self._wait_upstream(upstream_id, timeout=330)
-        if status != "ok":
-            raise RuntimeError(f"upstream job ended with status {status}")
+        upstream_id = None
+        try:
+            upstream_id = self._create_upstream_job(upstream_payload)
+            status = self._wait_upstream(upstream_id, timeout=330)
+            if status != "ok":
+                raise RuntimeError(f"upstream job ended with status {status}")
 
-        rows = self._download_rows(upstream_id)
-        candidates = dedupe_and_rank(rows, query)[:MAX_CANDIDATES]
-        top = candidates[0] if candidates else None
+            rows = self._download_rows(upstream_id)
+            candidates = dedupe_and_rank(rows, query)[:MAX_CANDIDATES]
+            top = candidates[0] if candidates else None
 
-        result = {
-            "source": "google_maps",
-            "upstream_job_id": upstream_id,
-            "candidate_count": len(candidates),
-            "lightweight_mode": LIGHTWEIGHT_MODE,
-            "email_extraction": not LIGHTWEIGHT_MODE,
-            "top_candidate": top,
-            "candidates": candidates,
-        }
+            result = {
+                "source": "google_maps",
+                "upstream_job_id": upstream_id,
+                "candidate_count": len(candidates),
+                "lightweight_mode": LIGHTWEIGHT_MODE,
+                "email_extraction": not LIGHTWEIGHT_MODE,
+                "top_candidate": top,
+                "candidates": candidates,
+            }
 
-        with self.jobs_lock:
-            job = self.jobs[job_id]
-            job["status"] = "ok"
-            job["result"] = result
-            job["finished_at"] = time.time()
+            with self.jobs_lock:
+                job = self.jobs[job_id]
+                job["status"] = "ok"
+                job["result"] = result
+                job["finished_at"] = time.time()
+        finally:
+            if upstream_id:
+                self._delete_upstream_job(upstream_id)
 
     def _backend_request(self, method, path, body=None, timeout=60):
         headers = {"Content-Type": "application/json", "User-Agent": UA}
@@ -451,6 +518,18 @@ class EnrichmentManager:
         if not job_id:
             raise RuntimeError("upstream scraper did not return a job id")
         return job_id
+
+    def _delete_upstream_job(self, upstream_id):
+        try:
+            self._backend_request("DELETE", f"/api/v1/jobs/{upstream_id}", timeout=30)
+        except Exception as exc:
+            print(json.dumps({
+                "level": "warning",
+                "component": "exporadar_enrichment",
+                "message": "failed to delete completed upstream job",
+                "upstream_job_id": upstream_id,
+                "error": str(exc),
+            }, ensure_ascii=False), flush=True)
 
     def _wait_upstream(self, upstream_id, timeout=330):
         deadline = time.time() + timeout
