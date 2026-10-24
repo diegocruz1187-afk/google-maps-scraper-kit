@@ -2,8 +2,14 @@ FROM gosom/google-maps-scraper:v1.18.1
 
 USER root
 
+# Security refresh (2026-10): rebuild the container with the current Debian
+# trust store and OpenSSL so HTTPS clients no longer rely on stale CA data.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        openssl \
+        python3 \
+    && update-ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
